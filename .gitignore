@@ -1,0 +1,20 @@
+# Private settings and credentials: never commit these
+config.txt
+service-account*.json
+
+# Data about real people (recipients' addresses, the emails you sent)
+sent_log.csv
+preview/
+*.eml
+
+# Real spreadsheets. A sample named example_*.xlsx is allowed.
+*.xlsx
+!example_*.xlsx
+
+# Template
+template.txt
+
+# Python / OS clutter
+venv/
+__pycache__/
+.DS_Store
