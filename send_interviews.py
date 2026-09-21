@@ -224,30 +224,84 @@ def drop_empty_optional(template, ctx):
     return out
 
 
-IF_RE = re.compile(r"\{IF ([A-Z][A-Z0-9 _]*)\}(.*?)\{END IF\}", re.DOTALL)
+TPL = "TEMPLATE|"  # marks a template-structure problem in the `missing` set
+TAG_RE = re.compile(r"(\{IF [A-Z][A-Z0-9 _]*\}|\{ELSE\}|\{END IF\})")
+FALSE_WORDS = {"", "no", "n", "false", "0", "none", "n/a"}  # anything else counts as "yes"
 
 
 def resolve_conditionals(template, ctx, missing, notes):
-    """{IF FIELD NAME} ... {END IF}: keep the text if the field has a value, otherwise remove all of it."""
-    skipped = []
+    """
+    {IF FIELD} text {END IF}             keep the text only if FIELD has a value
+    {IF FIELD} a {ELSE} b {END IF}       use a if FIELD has a value, otherwise b
+    A field counts as "no" if it is blank or says no / n / false / 0 / none / n/a (any capitals).
+    Blocks can be nested. Only the branch that is used is checked and reported.
+    """
+    tokens = TAG_RE.split(template)  # even positions: plain text, odd positions: {IF ..} / {ELSE} / {END IF}
+    pos = 0
+    dropped = False
 
-    def sub(m):
-        name = norm(m.group(1))
-        if name not in ctx and name not in OPTIONAL_FIELDS:
-            missing.add(f"{{IF {m.group(1)}}} (no column with that name)")
+    def parse_seq(active):
+        """Read text and nested blocks up to the next {ELSE} / {END IF} (left for the caller)."""
+        nonlocal pos
+        out = []
+        while pos < len(tokens):
+            tok = tokens[pos]
+            if pos % 2 == 0:
+                if active:
+                    out.append(tok)
+                pos += 1
+            elif tok in ("{ELSE}", "{END IF}"):
+                break
+            else:
+                out.append(parse_block(tok, active))
+        return "".join(out)
+
+    def parse_block(tag, active):
+        nonlocal pos, dropped
+        label = tag[4:-1]
+        name = norm(label)
+        pos += 1
+        known_field = name in ctx or name in OPTIONAL_FIELDS
+        if active and not known_field:
+            missing.add(TPL + f"{{IF {label}}} (no column with that name)")
+        truthy = known_field and ctx.get(name, "").strip().lower() not in FALSE_WORDS
+        if_text = parse_seq(active and truthy)
+        else_text, has_else = "", False
+        if pos < len(tokens) and tokens[pos] == "{ELSE}":
+            has_else = True
+            pos += 1
+            else_text = parse_seq(active and known_field and not truthy)
+            while pos < len(tokens) and tokens[pos] == "{ELSE}":
+                missing.add(TPL + f"{{IF {label}}} has more than one {{ELSE}}")
+                pos += 1
+                parse_seq(False)
+        if pos < len(tokens) and tokens[pos] == "{END IF}":
+            pos += 1
+        else:
+            missing.add(TPL + f"{{IF {label}}} has no {{END IF}}")
+        if not (active and known_field):
             return ""
-        if ctx.get(name):
-            return m.group(2)
-        skipped.append(name)
-        notes.add(f"left out the text inside {{IF {m.group(1)}}} because {name} is blank")
-        return ""
+        if truthy:
+            return if_text
+        dropped = True
+        if has_else:
+            notes.add(f"{{IF {label}}}: {name} is blank or no, so the {{ELSE}} text was used")
+        else:
+            notes.add(f"left out the text inside {{IF {label}}} because {name} is blank or no")
+        return else_text
 
-    out = IF_RE.sub(sub, template)
-    if re.search(r"\{\s*(?:IF|END\s*IF)", out, re.I):
-        missing.add("{IF ...} / {END IF} (mismatched or badly written; use {IF FIELD NAME} ... {END IF})")
-    if skipped:
-        out = re.sub(r"\n{3,}", "\n\n", out)  # don't leave a gap if a whole paragraph was removed
-    return out
+    out = []
+    while pos < len(tokens):
+        out.append(parse_seq(True))
+        if pos < len(tokens):
+            missing.add(TPL + "a stray {ELSE} or {END IF} with no matching {IF FIELD NAME}")
+            pos += 1
+    result = "".join(out)
+    if re.search(r"\{\s*(?:IF|ELSE|END\s*IF)", result, re.I):
+        missing.add(TPL + "{IF ...} / {ELSE} / {END IF} written wrongly (use capitals, e.g. {IF FIELD NAME} ... {END IF})")
+    if dropped:
+        result = re.sub(r"\n{3,}", "\n\n", result)  # don't leave a gap if a whole paragraph was removed
+    return result
 
 
 def render(template, ctx, missing, notes=None):
@@ -340,7 +394,13 @@ def build_messages(args, cfg):
         subject = render(ctx.get("subject_line") or ctx.get("subject") or subject_tpl, ctx, missing, notes)
         body = render(body_tpl, ctx, missing, notes)
         if missing:
-            problems.append(f"{where}: empty or unknown value for {', '.join(sorted(m if m.startswith('{') else f'[{m}]' for m in missing))}")
+            fields = sorted(f"[{m}]" for m in missing if not m.startswith(TPL))
+            for issue in sorted(m[len(TPL):] for m in missing if m.startswith(TPL)):
+                msg = f"template problem: {issue}"  # same for every row, so report it once
+                if msg not in problems:
+                    problems.append(msg)
+            if fields:
+                problems.append(f"{where}: empty or unknown value for {', '.join(fields)}")
             continue
 
         subject = to_subject(subject)
@@ -411,8 +471,8 @@ def get_config(args):
         "security": setting("SMTP_SECURITY", "starttls").lower(),
         "loopback_insecure": insecure,
         "from_addr": setting("FROM_ADDRESS").strip() or user,
-        "from_name": setting("FROM_NAME", ""),
-        "reply_to": setting("REPLY_TO", "").strip(),
+        "from_name": setting("FROM_NAME", "Kari"),
+        "reply_to": setting("REPLY_TO", "kari.mcmahon.freelance@proton.me").strip(),
     }
 
 
