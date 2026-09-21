@@ -175,7 +175,7 @@ def read_sheet(tabs, tab):
     headers = [norm(h) for h in rows[0][1]]
     out = []
     for rownum, vals in rows[1:]:
-        data = {h: v for h, v in zip(headers, vals) if h}
+        data = {h: (vals[i] if i < len(vals) else "") for i, h in enumerate(headers) if h}
         if any(data.values()):
             out.append((rownum, data))
     return out
@@ -224,6 +224,7 @@ def drop_empty_optional(template, ctx):
     return out
 
 
+EMPTY = "\x00"  # internal marker: "this {IF} block produced no text"
 TPL = "TEMPLATE|"  # marks a template-structure problem in the `missing` set
 TAG_RE = re.compile(r"(\{IF [A-Z][A-Z0-9 _]*\}|\{ELSE\}|\{END IF\})")
 FALSE_WORDS = {"", "no", "n", "false", "0", "none", "n/a"}  # anything else counts as "yes"
@@ -233,12 +234,12 @@ def resolve_conditionals(template, ctx, missing, notes):
     """
     {IF FIELD} text {END IF}             keep the text only if FIELD has a value
     {IF FIELD} a {ELSE} b {END IF}       use a if FIELD has a value, otherwise b
+    {IF NOT FIELD} ... {END IF}          the reverse: use the text only if FIELD is blank / no
     A field counts as "no" if it is blank or says no / n / false / 0 / none / n/a (any capitals).
     Blocks can be nested. Only the branch that is used is checked and reported.
     """
     tokens = TAG_RE.split(template)  # even positions: plain text, odd positions: {IF ..} / {ELSE} / {END IF}
     pos = 0
-    dropped = False
 
     def parse_seq(active):
         """Read text and nested blocks up to the next {ELSE} / {END IF} (left for the caller)."""
@@ -257,14 +258,16 @@ def resolve_conditionals(template, ctx, missing, notes):
         return "".join(out)
 
     def parse_block(tag, active):
-        nonlocal pos, dropped
-        label = tag[4:-1]
-        name = norm(label)
+        nonlocal pos
+        label = tag[4:-1]  # e.g. "KNOWN" or "NOT KNOWN"
+        negate = label.startswith("NOT ")
+        name = norm(label[4:] if negate else label)
         pos += 1
         known_field = name in ctx or name in OPTIONAL_FIELDS
         if active and not known_field:
             missing.add(TPL + f"{{IF {label}}} (no column with that name)")
-        truthy = known_field and ctx.get(name, "").strip().lower() not in FALSE_WORDS
+        has_value = known_field and ctx.get(name, "").strip().lower() not in FALSE_WORDS
+        truthy = known_field and ((not has_value) if negate else has_value)
         if_text = parse_seq(active and truthy)
         else_text, has_else = "", False
         if pos < len(tokens) and tokens[pos] == "{ELSE}":
@@ -282,13 +285,16 @@ def resolve_conditionals(template, ctx, missing, notes):
         if not (active and known_field):
             return ""
         if truthy:
-            return if_text
-        dropped = True
-        if has_else:
-            notes.add(f"{{IF {label}}}: {name} is blank or no, so the {{ELSE}} text was used")
+            chosen = if_text
         else:
-            notes.add(f"left out the text inside {{IF {label}}} because {name} is blank or no")
-        return else_text
+            why = f"{name} has a value" if negate else f"{name} is blank or no"
+            if has_else:
+                notes.add(f"{{IF {label}}}: {why}, so the {{ELSE}} text was used")
+            else:
+                notes.add(f"left out the text inside {{IF {label}}} because {why}")
+            chosen = else_text
+        # A block that ends up with no text leaves a marker, so its line can be removed below
+        return chosen if chosen.replace(EMPTY, "").strip() else EMPTY
 
     out = []
     while pos < len(tokens):
@@ -299,7 +305,10 @@ def resolve_conditionals(template, ctx, missing, notes):
     result = "".join(out)
     if re.search(r"\{\s*(?:IF|ELSE|END\s*IF)", result, re.I):
         missing.add(TPL + "{IF ...} / {ELSE} / {END IF} written wrongly (use capitals, e.g. {IF FIELD NAME} ... {END IF})")
-    if dropped:
+    if EMPTY in result:
+        # A line holding nothing but removed blocks disappears completely, including its line break
+        result = re.sub(r"(?m)^[ \t]*(?:" + EMPTY + r"[ \t]*)+(?:\n|\Z)", "", result)
+        result = result.replace(EMPTY, "")
         result = re.sub(r"\n{3,}", "\n\n", result)  # don't leave a gap if a whole paragraph was removed
     return result
 
